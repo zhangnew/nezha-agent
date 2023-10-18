@@ -23,6 +23,7 @@ import (
 	"github.com/go-ping/ping"
 	"github.com/gorilla/websocket"
 	"github.com/nezhahq/go-github-selfupdate/selfupdate"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
 	psnet "github.com/shirou/gopsutil/v3/net"
@@ -68,6 +69,13 @@ var (
 			return http.ErrUseLastResponse
 		},
 		Timeout: time.Second * 30,
+	}
+	httpClient3 = &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout:   time.Second * 30,
+		Transport: &http3.RoundTripper{},
 	}
 )
 
@@ -394,7 +402,12 @@ func handleIcmpPingTask(task *pb.Task, result *pb.TaskResult) {
 
 func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 	start := time.Now()
-	resp, err := httpClient.Get(task.GetData())
+	taskUrl := task.GetData()
+	resp, err := httpClient.Get(taskUrl)
+	checkHttpResp(taskUrl, start, resp, err, result)
+}
+
+func checkHttpResp(taskUrl string, start time.Time, resp *http.Response, err error, result *pb.TaskResult) {
 	if err == nil {
 		// 检查 HTTP Response 状态
 		result.Delay = float32(time.Since(start).Microseconds()) / 1000.0
@@ -409,9 +422,9 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 			result.Data = c.Issuer.CommonName + "|" + c.NotAfter.String()
 		}
 		altSvc := resp.Header.Get("Alt-Svc")
-		parsedUrl, _ := url.Parse(task.Data)
-		originalHost := parsedUrl.Hostname()
-		if checkAltSvc(altSvc, originalHost, result) {
+		if altSvc != "" {
+			checkAltSvc(start, altSvc, taskUrl, result)
+		} else {
 			result.Successful = true
 		}
 	} else {
@@ -420,51 +433,56 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 	}
 }
 
-func checkAltSvc(altSvcStr string, originalHost string, result *pb.TaskResult) bool {
-	if altSvcStr == "" {
-		return true
+func checkAltSvc(start time.Time, altSvcStr string, taskUrl string, result *pb.TaskResult) {
+	altSvcList, err := altsvc.Parse(altSvcStr)
+	if err != nil {
+		result.Data = err.Error()
+		result.Successful = false
+		return
 	}
-	altSvcList, _ := altsvc.Parse(altSvcStr)
+
+	parsedUrl, _ := url.Parse(taskUrl)
+	originalHost := parsedUrl.Hostname()
+	originalPort := parsedUrl.Port()
+	if originalPort == "" {
+		switch parsedUrl.Scheme {
+		case "http":
+			originalPort = "80"
+		case "https":
+			originalPort = "443"
+		}
+	}
+
 	altAuthorityHost := ""
 	altAuthorityPort := ""
+	altAuthorityProtocol := ""
 	for _, altSvc := range altSvcList {
-		if altSvc.AltAuthority.Host != "" && altSvc.AltAuthority.Host != originalHost {
+		altAuthorityPort = altSvc.AltAuthority.Port
+		if altSvc.AltAuthority.Host != "" {
 			altAuthorityHost = altSvc.AltAuthority.Host
-			altAuthorityPort = altSvc.AltAuthority.Port
+			altAuthorityProtocol = altSvc.ProtocolID
+			break
 		}
 	}
 	if altAuthorityHost == "" {
-		return true
+		altAuthorityHost = originalHost
 	}
+	if altAuthorityHost == originalHost && altAuthorityPort == originalPort {
+		result.Successful = true
+		return
+	}
+
 	altAuthorityUrl := "https://" + altAuthorityHost + ":" + altAuthorityPort + "/"
-	println("checkAltSvc originalHost: ", originalHost, " AltSvc: ", altAuthorityUrl)
-	successful := false
 	req, _ := http.NewRequest("GET", altAuthorityUrl, nil)
 	req.Host = originalHost
-	req.Header.Add("Upgrade", originalHost)
-	req.Header.Add("Connection", "Upgrade")
 
-	start := time.Now()
-	resp, err := httpClient.Do(req)
-	if err == nil {
-		// 检查 HTTP Response 状态
-		result.Delay = float32(time.Since(start).Microseconds()) / 1000.0
-		if resp.StatusCode > 399 || resp.StatusCode < 200 {
-			err = errors.New("\n应用错误：" + resp.Status)
-		}
+	client := httpClient
+	if strings.HasPrefix(altAuthorityProtocol, "h3") {
+		client = httpClient3
 	}
-	if err == nil {
-		// 检查 SSL 证书信息
-		if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-			c := resp.TLS.PeerCertificates[0]
-			result.Data = c.Issuer.CommonName + "|" + c.NotAfter.String()
-		}
-		successful = true
-	} else {
-		// HTTP 请求失败
-		result.Data = err.Error()
-	}
-	return successful
+	resp, err := client.Do(req)
+
+	checkHttpResp(altAuthorityUrl, start, resp, err, result)
 }
 
 func handleCommandTask(task *pb.Task, result *pb.TaskResult) {
